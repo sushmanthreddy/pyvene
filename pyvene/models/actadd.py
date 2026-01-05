@@ -278,6 +278,7 @@ def create_actadd_model(
     coeff: float = 1.0,
     component: str = "block_output",
     position: Optional[int] = None,
+    prompt_length: Optional[int] = None,
 ) -> IntervenableModel:
     """
     Create an IntervenableModel configured for Activation Addition.
@@ -289,6 +290,7 @@ def create_actadd_model(
         coeff: Scaling coefficient for the steering vector
         component: Component to intervene on ("block_output", "mlp_output", etc.)
         position: If specified, only intervene at this token position
+        prompt_length: Length of the prompt (for padding the steering vector)
         
     Returns:
         An IntervenableModel configured for ActAdd steering
@@ -297,7 +299,8 @@ def create_actadd_model(
         >>> actadd_model = create_actadd_model(
         ...     model,
         ...     steering_vector=sv,  # From compute_steering_vector
-        ...     coeff=5.0
+        ...     coeff=5.0,
+        ...     prompt_length=5
         ... )
         >>> 
         >>> # Generate with steering
@@ -324,6 +327,15 @@ def create_actadd_model(
     # Apply coefficient to create the source representation
     scaled_vec = coeff * vec
     
+    # Pad steering vector to match prompt length if needed
+    if prompt_length is not None and scaled_vec.shape[1] < prompt_length:
+        padding_size = prompt_length - scaled_vec.shape[1]
+        padding = torch.zeros(
+            scaled_vec.shape[0], padding_size, scaled_vec.shape[2],
+            device=scaled_vec.device, dtype=scaled_vec.dtype
+        )
+        scaled_vec = torch.cat([scaled_vec, padding], dim=1)
+    
     # Get sequence length from steering vector
     seq_len = scaled_vec.shape[1]
     
@@ -349,6 +361,7 @@ def create_multi_layer_actadd_model(
     steering_vectors: List[Union[SteeringVector, Tuple[torch.Tensor, int]]],
     coeff: float = 1.0,
     component: str = "block_output",
+    prompt_length: Optional[int] = None,
 ) -> IntervenableModel:
     """
     Create an IntervenableModel with ActAdd at multiple layers.
@@ -395,6 +408,15 @@ def create_multi_layer_actadd_model(
         # Apply combined coefficient
         total_coeff = coeff * sv_coeff
         scaled_vec = total_coeff * vec
+        
+        # Pad steering vector to match prompt length if needed
+        if prompt_length is not None and scaled_vec.shape[1] < prompt_length:
+            padding_size = prompt_length - scaled_vec.shape[1]
+            padding = torch.zeros(
+                scaled_vec.shape[0], padding_size, scaled_vec.shape[2],
+                device=scaled_vec.device, dtype=scaled_vec.dtype
+            )
+            scaled_vec = torch.cat([scaled_vec, padding], dim=1)
         
         representations.append(
             RepresentationConfig(
@@ -468,6 +490,9 @@ def generate_with_steering(
     inputs = tokenizer(prompt, return_tensors="pt")
     inputs = {k: v.to(device) for k, v in inputs.items()}
     
+    # Get prompt length for padding
+    prompt_length = inputs["input_ids"].shape[1]
+    
     # Get layer from SteeringVector if needed
     if isinstance(steering_vector, SteeringVector):
         layer = steering_vector.layer
@@ -495,6 +520,7 @@ def generate_with_steering(
         layer=layer,
         coeff=coeff,
         component=component,
+        prompt_length=prompt_length,  # Pass prompt length for padding
     )
     
     with torch.no_grad():
