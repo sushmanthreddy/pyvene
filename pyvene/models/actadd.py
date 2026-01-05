@@ -596,6 +596,111 @@ def generate_with_steering(
     return unsteered_text, steered_text
 
 
+def generate_with_multi_layer_steering(
+    model: nn.Module,
+    tokenizer,
+    prompt: str,
+    steering_vectors: List[Union[SteeringVector, Tuple[torch.Tensor, int]]],
+    coeff: float = 1.0,
+    max_new_tokens: int = 50,
+    do_sample: bool = True,
+    temperature: float = 1.0,
+    top_p: float = 0.9,
+    **generate_kwargs,
+) -> Tuple[str, str]:
+    """
+    Generate text with multi-layer steering using direct PyTorch hooks.
+    
+    This applies steering vectors at multiple layers simultaneously,
+    using direct hooks for reliable KV-cached generation.
+    
+    Args:
+        model: The language model
+        tokenizer: The tokenizer
+        prompt: The input prompt
+        steering_vectors: List of SteeringVector objects or (tensor, layer) tuples
+        coeff: Global scaling coefficient applied to all vectors
+        max_new_tokens: Maximum tokens to generate
+        do_sample: Whether to use sampling
+        temperature: Sampling temperature
+        top_p: Top-p sampling parameter
+        **generate_kwargs: Additional arguments for model.generate()
+        
+    Returns:
+        Tuple of (unsteered_output, steered_output) as decoded strings
+        
+    Example:
+        >>> sv1 = pv.compute_steering_vector(model, tok, "Love", "Hate", layer=6)
+        >>> sv2 = pv.compute_steering_vector(model, tok, "Happy", "Sad", layer=12)
+        >>> unsteered, steered = pv.generate_with_multi_layer_steering(
+        ...     model, tokenizer,
+        ...     prompt="I feel terrible because",
+        ...     steering_vectors=[sv1, sv2],
+        ...     coeff=1.0,
+        ...     max_new_tokens=50
+        ... )
+    """
+    device = next(model.parameters()).device
+    
+    # Tokenize input
+    inputs = tokenizer(prompt, return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    
+    # Get prompt length
+    prompt_length = inputs["input_ids"].shape[1]
+    
+    # Generation kwargs
+    gen_kwargs = {
+        "max_new_tokens": max_new_tokens,
+        "do_sample": do_sample,
+        "temperature": temperature,
+        "top_p": top_p,
+        "pad_token_id": tokenizer.pad_token_id or tokenizer.eos_token_id,
+        **generate_kwargs
+    }
+    
+    # Generate unsteered output
+    with torch.no_grad():
+        unsteered_ids = model.generate(**inputs, **gen_kwargs)
+    unsteered_text = tokenizer.decode(unsteered_ids[0], skip_special_tokens=True)
+    
+    # Get transformer blocks
+    blocks = get_model_layers(model)
+    
+    # Register hooks for all steering vectors
+    handles = []
+    for sv in steering_vectors:
+        if isinstance(sv, SteeringVector):
+            layer = sv.layer
+            vec = sv.vector.to(device)
+            sv_coeff = coeff * sv.coeff
+        else:
+            vec, layer = sv
+            vec = vec.to(device) if hasattr(vec, 'to') else vec
+            sv_coeff = coeff
+        
+        # Ensure batch dimension
+        if len(vec.shape) == 2:
+            vec = vec.unsqueeze(0)
+        
+        target_block = blocks[layer]
+        hook_fn = _get_actadd_hook(vec, sv_coeff, prompt_length)
+        handle = target_block.register_forward_hook(hook_fn)
+        handles.append(handle)
+    
+    try:
+        # Generate steered output with all hooks active
+        with torch.no_grad():
+            steered_ids = model.generate(**inputs, **gen_kwargs)
+        steered_text = tokenizer.decode(steered_ids[0], skip_special_tokens=True)
+    finally:
+        # Always remove all hooks
+        for handle in handles:
+            handle.remove()
+    
+    return unsteered_text, steered_text
+
+
 def compare_generations(
     model: nn.Module,
     tokenizer,

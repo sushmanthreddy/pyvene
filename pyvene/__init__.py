@@ -72,6 +72,7 @@ from .models.actadd import (
     create_actadd_model,
     create_multi_layer_actadd_model,
     generate_with_steering,
+    generate_with_multi_layer_steering,
     compare_generations,
     print_comparison,
     get_num_layers,
