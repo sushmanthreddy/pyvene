@@ -523,9 +523,15 @@ def generate_with_steering(
         prompt_length=prompt_length,  # Pass prompt length for padding
     )
     
+    # Create unit_locations for the prompt positions
+    # This tells pyvene to intervene at positions 0 to prompt_length-1
+    prompt_positions = list(range(prompt_length))
+    unit_locations = {"base": (None, prompt_positions)}
+    
     with torch.no_grad():
         _, steered_ids = actadd_model.generate(
             inputs,
+            unit_locations=unit_locations,
             intervene_on_prompt=True,  # Only intervene on prompt, not generated tokens
             **gen_kwargs
         )
