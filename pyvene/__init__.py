@@ -63,3 +63,16 @@ from .models.backpack_gpt2.modelings_intervenable_backpack_gpt2 import (
 )
 from .models.olmo.modelings_intervenable_olmo import create_olmo
 from .models.gpt_oss.modelings_intervenable_gpt_oss import create_gpt_oss
+
+# ActAdd (Activation Addition) utilities
+from .models.actadd import (
+    SteeringVector,
+    ActAddIntervention,
+    compute_steering_vector,
+    create_actadd_model,
+    create_multi_layer_actadd_model,
+    generate_with_steering,
+    compare_generations,
+    print_comparison,
+    get_num_layers,
+)
