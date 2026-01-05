@@ -36,7 +36,7 @@ Example usage:
 
 import torch
 import torch.nn as nn
-from typing import Optional, List, Union, Dict, Tuple, Any
+from typing import Optional, List, Union, Dict, Tuple
 from dataclasses import dataclass
 
 from .interventions import AdditionIntervention, ConstantSourceIntervention
