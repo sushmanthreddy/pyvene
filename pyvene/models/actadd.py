@@ -436,6 +436,60 @@ def create_multi_layer_actadd_model(
     return IntervenableModel(config, model)
 
 
+def _get_actadd_hook(steering_vec: torch.Tensor, coeff: float, prompt_length: int):
+    """
+    Create a hook function for ActAdd that properly handles variable sequence lengths.
+    
+    This hook adds the steering vector only during the prefill phase (when processing
+    the full prompt). During autoregressive decoding with KV-cache, only single tokens
+    are processed, so we skip the intervention.
+    
+    Args:
+        steering_vec: The steering vector tensor of shape (1, seq_len, hidden_dim)
+        coeff: Scaling coefficient
+        prompt_length: Length of the original prompt (for detecting prefill vs decode)
+    
+    Returns:
+        A hook function compatible with PyTorch's register_forward_hook
+    """
+    scaled_vec = coeff * steering_vec
+    
+    def hook_fn(module, input, output):
+        # output is typically a tuple: (hidden_states, ...) for transformer blocks
+        if isinstance(output, tuple):
+            hidden_states = output[0]
+        else:
+            hidden_states = output
+        
+        current_seq_len = hidden_states.shape[1]
+        
+        # Only intervene during prefill (when we have the full prompt)
+        # During decoding with KV-cache, seq_len will be 1 (single new token)
+        if current_seq_len == 1:
+            # Decoding phase - don't modify
+            return output
+        
+        # Create addition tensor matching current sequence length
+        device = hidden_states.device
+        dtype = hidden_states.dtype
+        
+        # Add steering vector only to overlapping positions
+        add_positions = min(scaled_vec.shape[1], current_seq_len)
+        
+        addition = torch.zeros_like(hidden_states)
+        addition[:, :add_positions, :] = scaled_vec[:, :add_positions, :].to(
+            device=device, dtype=dtype
+        )
+        
+        modified_hidden = hidden_states + addition
+        
+        if isinstance(output, tuple):
+            return (modified_hidden,) + output[1:]
+        return modified_hidden
+    
+    return hook_fn
+
+
 def generate_with_steering(
     model: nn.Module,
     tokenizer,
@@ -453,8 +507,8 @@ def generate_with_steering(
     """
     Generate text with and without steering for comparison.
     
-    This is a convenience function that creates the ActAdd model,
-    generates both steered and unsteered outputs, and returns decoded text.
+    Uses direct PyTorch hooks for reliable ActAdd during generation,
+    properly handling KV-cached autoregressive decoding.
     
     Args:
         model: The language model
@@ -464,7 +518,7 @@ def generate_with_steering(
         layer: Layer to intervene at (required if vector is tensor)
         coeff: Steering coefficient
         max_new_tokens: Maximum tokens to generate
-        component: Component to intervene on
+        component: Component to intervene on (currently only "block_output" supported)
         do_sample: Whether to use sampling
         temperature: Sampling temperature
         top_p: Top-p sampling parameter
@@ -490,13 +544,22 @@ def generate_with_steering(
     inputs = tokenizer(prompt, return_tensors="pt")
     inputs = {k: v.to(device) for k, v in inputs.items()}
     
-    # Get prompt length for padding
+    # Get prompt length
     prompt_length = inputs["input_ids"].shape[1]
     
-    # Get layer from SteeringVector if needed
+    # Extract steering vector and layer
     if isinstance(steering_vector, SteeringVector):
         layer = steering_vector.layer
-        steering_vector = steering_vector.to(device)
+        vec = steering_vector.vector.to(device)
+        coeff = coeff * steering_vector.coeff
+    else:
+        vec = steering_vector.to(device) if hasattr(steering_vector, 'to') else steering_vector
+        if layer is None:
+            raise ValueError("layer must be specified when steering_vector is a tensor")
+    
+    # Ensure vec has batch dimension
+    if len(vec.shape) == 2:
+        vec = vec.unsqueeze(0)
     
     # Generation kwargs
     gen_kwargs = {
@@ -513,29 +576,22 @@ def generate_with_steering(
         unsteered_ids = model.generate(**inputs, **gen_kwargs)
     unsteered_text = tokenizer.decode(unsteered_ids[0], skip_special_tokens=True)
     
-    # Create ActAdd model and generate steered output
-    actadd_model = create_actadd_model(
-        model,
-        steering_vector=steering_vector,
-        layer=layer,
-        coeff=coeff,
-        component=component,
-        prompt_length=prompt_length,  # Pass prompt length for padding
-    )
+    # Get the transformer blocks
+    blocks = get_model_layers(model)
+    target_block = blocks[layer]
     
-    # Create unit_locations for the prompt positions
-    # This tells pyvene to intervene at positions 0 to prompt_length-1
-    prompt_positions = list(range(prompt_length))
-    unit_locations = {"base": (None, prompt_positions)}
+    # Create and register the hook
+    hook_fn = _get_actadd_hook(vec, coeff, prompt_length)
+    handle = target_block.register_forward_hook(hook_fn)
     
-    with torch.no_grad():
-        _, steered_ids = actadd_model.generate(
-            inputs,
-            unit_locations=unit_locations,
-            intervene_on_prompt=True,  # Only intervene on prompt, not generated tokens
-            **gen_kwargs
-        )
-    steered_text = tokenizer.decode(steered_ids[0], skip_special_tokens=True)
+    try:
+        # Generate steered output with hook active
+        with torch.no_grad():
+            steered_ids = model.generate(**inputs, **gen_kwargs)
+        steered_text = tokenizer.decode(steered_ids[0], skip_special_tokens=True)
+    finally:
+        # Always remove the hook
+        handle.remove()
     
     return unsteered_text, steered_text
 
