@@ -176,32 +176,21 @@ def extract_activations(
     if device is None:
         device = next(model.parameters()).device
     
-    # Create a minimal intervenable config just for collecting activations
-    from .interventions import CollectIntervention
-    
-    config = IntervenableConfig(
-        representations=[
-            RepresentationConfig(
-                layer=layer,
-                component=component,
-                unit="pos",
-                max_number_of_units=1,
-                intervention_type=CollectIntervention,
-            )
-        ]
-    )
-    
-    intervenable = IntervenableModel(config, model)
-    
     # Tokenize inputs
     inputs = tokenizer(prompts, return_tensors="pt", padding=True)
     inputs = {k: v.to(device) for k, v in inputs.items()}
     
-    # Run forward pass and collect activations
-    (_, collected), _ = intervenable(inputs)
+    # Use model's native hidden states output (most reliable)
+    outputs = model(**inputs, output_hidden_states=True)
     
-    # collected is a list with one element per intervention
-    activations = collected[0]
+    # hidden_states is a tuple of (num_layers + 1,) tensors
+    # Index 0 is embeddings, index 1 is after layer 0, etc.
+    # So layer N's output is at index N+1
+    hidden_states = outputs.hidden_states
+    
+    # Get activations at the specified layer (after that layer's processing)
+    # layer=0 means output of first transformer block, which is hidden_states[1]
+    activations = hidden_states[layer + 1]
     
     return activations
 
@@ -314,43 +303,42 @@ def create_actadd_model(
         >>> # Generate with steering
         >>> _, output = actadd_model.generate(
         ...     tokenizer("I hate you because", return_tensors="pt"),
-        ...     max_new_tokens=50
+        ...     max_new_tokens=50,
+        ...     intervene_on_prompt=True
         ... )
     """
     # Extract info from SteeringVector if provided
     if isinstance(steering_vector, SteeringVector):
-        vec = steering_vector.vector
+        vec = steering_vector.vector.clone()
         layer = steering_vector.layer
         coeff = coeff * steering_vector.coeff  # Combine coefficients
     else:
-        vec = steering_vector
+        vec = steering_vector.clone() if hasattr(steering_vector, 'clone') else steering_vector
         if layer is None:
             raise ValueError("layer must be specified when steering_vector is a tensor")
     
-    # Apply coefficient
+    # Ensure proper shape (1, seq_len, hidden_dim)
+    if len(vec.shape) == 2:
+        vec = vec.unsqueeze(0)
+    
+    # Apply coefficient to create the source representation
     scaled_vec = coeff * vec
     
-    # Ensure proper shape (1, seq_len, hidden_dim)
-    if len(scaled_vec.shape) == 2:
-        scaled_vec = scaled_vec.unsqueeze(0)
+    # Get sequence length from steering vector
+    seq_len = scaled_vec.shape[1]
     
-    # Create intervention with constant source
-    intervention = ActAddIntervention(
-        steering_vector=vec,
-        coeff=coeff,
-    )
-    
-    # Create config
+    # Create config with AdditionIntervention and constant source
     config = IntervenableConfig(
         representations=[
             RepresentationConfig(
                 layer=layer,
                 component=component,
                 unit="pos",
-                max_number_of_units=scaled_vec.shape[1],
-                intervention=intervention,
+                max_number_of_units=seq_len,
+                source_representation=scaled_vec,
             )
-        ]
+        ],
+        intervention_types=AdditionIntervention,
     )
     
     return IntervenableModel(config, model)
@@ -388,40 +376,41 @@ def create_multi_layer_actadd_model(
         ... )
     """
     representations = []
+    intervention_types = []
     
     for sv in steering_vectors:
         if isinstance(sv, SteeringVector):
-            vec = sv.vector
+            vec = sv.vector.clone()
             layer = sv.layer
             sv_coeff = sv.coeff
         else:
             vec, layer = sv
+            vec = vec.clone() if hasattr(vec, 'clone') else vec
             sv_coeff = 1.0
-        
-        # Apply combined coefficient
-        total_coeff = coeff * sv_coeff
-        
-        # Create intervention
-        intervention = ActAddIntervention(
-            steering_vector=vec,
-            coeff=total_coeff,
-        )
         
         # Ensure proper shape
         if len(vec.shape) == 2:
             vec = vec.unsqueeze(0)
+        
+        # Apply combined coefficient
+        total_coeff = coeff * sv_coeff
+        scaled_vec = total_coeff * vec
         
         representations.append(
             RepresentationConfig(
                 layer=layer,
                 component=component,
                 unit="pos",
-                max_number_of_units=vec.shape[1],
-                intervention=intervention,
+                max_number_of_units=scaled_vec.shape[1],
+                source_representation=scaled_vec,
             )
         )
+        intervention_types.append(AdditionIntervention)
     
-    config = IntervenableConfig(representations=representations)
+    config = IntervenableConfig(
+        representations=representations,
+        intervention_types=intervention_types,
+    )
     return IntervenableModel(config, model)
 
 
@@ -511,6 +500,7 @@ def generate_with_steering(
     with torch.no_grad():
         _, steered_ids = actadd_model.generate(
             inputs,
+            intervene_on_prompt=True,  # Only intervene on prompt, not generated tokens
             **gen_kwargs
         )
     steered_text = tokenizer.decode(steered_ids[0], skip_special_tokens=True)
